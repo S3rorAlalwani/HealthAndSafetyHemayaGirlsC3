@@ -22,7 +22,20 @@ form{display:grid;grid-template-columns:1fr 1fr;gap:14px}.full{grid-column:1/-1}
 </style>
 </head>
 <body>
-<div class="app">
+<div id="loginPanel" style="min-height:100vh;display:grid;place-items:center;padding:20px;background:#f5f8fc">
+  <div class="card" style="width:min(420px,100%);text-align:right">
+    <h2>🛡️ تسجيل دخول موظفي الأمن والسلامة</h2>
+    <p style="color:#6d7d91">الدخول متاح فقط للحسابات المعتمدة من إدارة المدرسة.</p>
+    <form id="loginForm" style="display:block">
+      <label>البريد الإلكتروني<input id="loginEmail" type="email" autocomplete="username" required></label>
+      <label>كلمة المرور<input id="loginPassword" type="password" autocomplete="current-password" required></label>
+      <button class="primary" type="submit" style="margin-top:16px;width:100%">دخول</button>
+    </form>
+    <p id="loginMessage" role="alert" style="color:#b42318"></p>
+  </div>
+</div>
+<div id="syncMessage" role="status" aria-live="polite" style="display:none;position:fixed;z-index:20;bottom:15px;left:15px;right:15px;max-width:500px;margin:auto;background:#06244d;color:white;border-radius:12px;padding:14px;text-align:center"></div>
+<div class="app" id="hemayaApp" style="display:none">
 <aside class="sidebar">
   <div class="brand"><div class="shield">🛡️</div><span>الأمن والسلامة<br>المدرسية</span></div>
   <div class="nav">
@@ -102,14 +115,91 @@ form{display:grid;grid-template-columns:1fr 1fr;gap:14px}.full{grid-column:1/-1}
 <div class="card"><h2>🏃 الإخلاء</h2><p>اتباع مسارات الإخلاء ونقطة التجمع، والتأكد من حصر جميع الأشخاص.</p></div>
 </div></section>
 
-<section id="settings" class="page"><div class="card"><h2>الإعدادات</h2><p>نسخة تجريبية محلية: يتم حفظ البيانات داخل المتصفح باستخدام LocalStorage.</p><button class="primary danger" onclick="resetData()">مسح جميع البيانات التجريبية</button></div></section>
+<section id="settings" class="page"><div class="card"><h2>الإعدادات</h2><p>يتم حفظ السجلات المشتركة في Supabase للحسابات المعتمدة. البيانات المحلية القديمة لم يتم حذفها أو نقلها تلقائياً.</p><p id="staffEmail"></p><button class="primary" onclick="refreshData()">🔄 تحديث السجلات</button> <button class="primary danger" onclick="signOutStaff()">تسجيل الخروج</button></div></section>
 </main></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
-const key='safetyAppData';
-let data=JSON.parse(localStorage.getItem(key)||'{"inspections":[],"incidents":[],"risks":[]}');
+// Browser publishable key: safe to include in public frontend ONLY with correctly configured RLS.
+const SUPABASE_URL = 'https://tnzjzplfdzghilejjhyl.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_pi5jm7rWOgeyrbtKFhyN9Q_LTasL0U8';
+const client = window.supabase?.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
 const $=id=>document.getElementById(id);
-function save(){localStorage.setItem(key,JSON.stringify(data));render();}
+let data={inspections:[],incidents:[],risks:[]};
+let currentUser=null;
+let busy=false;
+function notify(message, isError=false){
+ const el=$('syncMessage');el.textContent=message;el.style.display='block';el.style.background=isError?'#a52626':'#06244d';
+}
+function clearNotify(){$('syncMessage').style.display='none';}
+function errorText(error){return error?.message || 'حدث خطأ غير معروف';}
+function showLogin(message=''){
+ currentUser=null;$('hemayaApp').style.display='none';$('loginPanel').style.display='grid';
+ $('loginMessage').textContent=message;data={inspections:[],incidents:[],risks:[]};render();
+}
+async function authorized(user){
+ if(!user)return false;
+ const {data:member,error}=await client.from('staff_members').select('user_id').eq('user_id',user.id).maybeSingle();
+ if(error)throw error;
+ return Boolean(member);
+}
+async function openStaffSession(user){
+ try{
+  if(!await authorized(user)){
+   await client.auth.signOut();showLogin('هذا الحساب غير معتمد ضمن موظفي المدرسة.');return;
+  }
+  currentUser=user;$('staffEmail').textContent='الحساب: '+(user.email||'');
+  await refreshData();
+  $('loginPanel').style.display='none';$('hemayaApp').style.display='flex';
+ }catch(err){showLogin('تعذر التحقق من صلاحيات الحساب: '+errorText(err));}
+}
+async function refreshData(){
+ if(!currentUser || !client)return;
+ try{
+  // Fetch pages to avoid silently truncating records at the default 1,000-row API limit.
+  const next={inspections:[],incidents:[],risks:[]};
+  for(const name of Object.keys(next)){
+   let offset=0;
+   while(true){
+    const {data:rows,error}=await client.from(name).select('*').order('id',{ascending:false}).range(offset,offset+499);
+    if(error)throw error;
+    next[name].push(...rows);
+    if(rows.length<500)break;
+    offset+=500;
+   }
+  }
+  data=next;render();clearNotify();
+ }catch(err){notify('تعذر تحميل السجلات: '+errorText(err),true);throw err;}
+}
+async function addRecord(table,record,form){
+ if(busy||!currentUser)return;
+ busy=true;const button=form.querySelector('button[type="submit"],button:not([type])');
+ if(button)button.disabled=true;
+ try{
+  const {error}=await client.from(table).insert({...record,created_by:currentUser.id});
+  if(error)throw error;
+  await refreshData();form.reset();
+  if(table==='inspections')$('iDate').value=localDate();
+  notify('تم حفظ السجل بنجاح في قاعدة البيانات المشتركة.');
+ }catch(err){notify('لم يتم حفظ السجل: '+errorText(err),true);}
+ finally{busy=false;if(button)button.disabled=false;}
+}
+function localDate(){const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+async function signOutStaff(){
+ if(client)await client.auth.signOut();showLogin('تم تسجيل الخروج.');clearNotify();
+}
+$('loginForm').onsubmit=async e=>{
+ e.preventDefault();$('loginMessage').textContent='جارٍ التحقق...';
+ if(!client){$('loginMessage').textContent='تعذر تحميل مكتبة Supabase. تحقق من اتصال الإنترنت.';return;}
+ const button=e.target.querySelector('button');button.disabled=true;
+ try{
+  const {data:result,error}=await client.auth.signInWithPassword({email:$('loginEmail').value.trim(),password:$('loginPassword').value});
+  if(error)throw error;
+  await openStaffSession(result.user);
+  $('loginPassword').value='';
+ }catch(err){$('loginMessage').textContent='تعذر تسجيل الدخول: '+errorText(err);}
+ finally{button.disabled=false;}
+};
 function esc(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
 function badge(s){let c=s==='مطابق'||s==='مغلق'?'b-green':(s==='غير مطابق'||s==='مفتوح'?'b-red':'b-yellow');return `<span class="badge ${c}">${esc(s)}</span>`}
 function showPage(id){
@@ -120,10 +210,10 @@ function showPage(id){
  $('pageTitle').textContent=titles[id]; window.scrollTo(0,0);
 }
 document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>showPage(b.dataset.page));
-$('iDate').value=new Date().toISOString().slice(0,10); $('today').textContent=new Date().toLocaleDateString('ar-AE',{dateStyle:'medium'});
-$('inspectionForm').onsubmit=e=>{e.preventDefault();data.inspections.unshift({id:Date.now(),location:$('iLocation').value,item:$('iItem').value,status:$('iStatus').value,date:$('iDate').value,notes:$('iNotes').value});e.target.reset();$('iDate').value=new Date().toISOString().slice(0,10);save();};
-$('incidentForm').onsubmit=e=>{e.preventDefault();data.incidents.unshift({id:Date.now(),type:$('cType').value,location:$('cLocation').value,date:$('cDate').value,status:$('cStatus').value,desc:$('cDesc').value});e.target.reset();save();};
-$('riskForm').onsubmit=e=>{e.preventDefault();data.risks.unshift({id:Date.now(),desc:$('rDesc').value,location:$('rLocation').value,level:$('rLevel').value,status:$('rStatus').value});e.target.reset();save();};
+$('iDate').value=localDate();$('today').textContent=new Date().toLocaleDateString('ar-AE',{dateStyle:'medium'});
+$('inspectionForm').onsubmit=e=>{e.preventDefault();addRecord('inspections',{location:$('iLocation').value,item:$('iItem').value,status:$('iStatus').value,date:$('iDate').value,notes:$('iNotes').value},e.target);};
+$('incidentForm').onsubmit=e=>{e.preventDefault();addRecord('incidents',{type:$('cType').value,location:$('cLocation').value,date:$('cDate').value,status:$('cStatus').value,desc:$('cDesc').value},e.target);};
+$('riskForm').onsubmit=e=>{e.preventDefault();addRecord('risks',{desc:$('rDesc').value,location:$('rLocation').value,level:$('rLevel').value,status:$('rStatus').value},e.target);};
 function tableIns(){if(!data.inspections.length)return '<div class="empty">لا توجد عمليات تفتيش حتى الآن.</div>';return `<table><tr><th>الموقع</th><th>البند</th><th>الحالة</th><th>التاريخ</th></tr>${data.inspections.map(x=>`<tr><td>${esc(x.location)}</td><td>${esc(x.item)}<br><small>${esc(x.notes)}</small></td><td>${badge(x.status)}</td><td>${esc(x.date)}</td></tr>`).join('')}</table>`}
 function tableInc(){if(!data.incidents.length)return '<div class="empty">لا توجد بلاغات.</div>';return `<table><tr><th>النوع</th><th>الموقع</th><th>الحالة</th><th>التاريخ</th></tr>${data.incidents.map(x=>`<tr><td>${esc(x.type)}<br><small>${esc(x.desc)}</small></td><td>${esc(x.location)}</td><td>${badge(x.status)}</td><td>${esc(x.date)}</td></tr>`).join('')}</table>`}
 function tableRisk(){if(!data.risks.length)return '<div class="empty">لا توجد مخاطر مسجلة.</div>';return `<table><tr><th>الخطر</th><th>الموقع</th><th>الخطورة</th><th>الحالة</th></tr>${data.risks.map(x=>`<tr><td>${esc(x.desc)}</td><td>${esc(x.location)}</td><td>${esc(x.level)}</td><td>${badge(x.status)}</td></tr>`).join('')}</table>`}
@@ -136,8 +226,13 @@ function render(){
  $('recentIncidents').innerHTML=data.incidents.length?data.incidents.slice(0,4).map(x=>`<p>🚨 ${esc(x.type)} — ${badge(x.status)}</p>`).join(''):'<div class="empty">لا توجد بلاغات</div>';
  const needs=data.inspections.filter(x=>x.status!=='مطابق'); $('actionsTable').innerHTML=needs.length?`<table><tr><th>الموقع</th><th>البند</th><th>الحالة</th><th>الإجراء</th></tr>${needs.map(x=>`<tr><td>${esc(x.location)}</td><td>${esc(x.item)}</td><td>${badge(x.status)}</td><td>متابعة وتصحيح الملاحظة</td></tr>`).join('')}</table>`:'<div class="empty">لا توجد إجراءات تصحيحية معلقة 🎉</div>';
 }
-function resetData(){if(confirm('هل تريد مسح جميع البيانات؟')){data={inspections:[],incidents:[],risks:[]};save();}}
 render();
+(async function init(){
+ if(!client){showLogin('تعذر تحميل Supabase. تحقق من اتصال الإنترنت.');return;}
+ const {data:session,error}=await client.auth.getSession();
+ if(error){showLogin('تعذر استعادة الجلسة: '+errorText(error));return;}
+ if(session.session?.user)await openStaffSession(session.session.user);
+})().catch(err=>showLogin('تعذر بدء التطبيق: '+errorText(err)));
 </script>
 </body>
 </html>
